@@ -83,3 +83,26 @@ TEST_F(FlWaylandDisplayTest, CreateSubsurface) {
 
   fl_mock_wayland_free_surface(parent_surface);
 }
+
+// Presentation feedback is optional; binding it must not affect the required
+// compositor and subcompositor globals.
+TEST_F(FlWaylandDisplayTest, PresentationOptional) {
+  wayland.has_presentation = true;
+
+  g_autoptr(FlWaylandDisplay) display =
+      fl_wayland_display_open(fl_mock_wayland_get_display());
+  ASSERT_NE(display, nullptr);
+  EXPECT_NE(fl_wayland_display_get_presentation(display), nullptr);
+  // The mock does not send the clock id event, so the clock is unknown and the
+  // tracker must not use the feedback.
+  EXPECT_EQ(fl_wayland_display_get_presentation_clock_id(display), 0u);
+}
+
+TEST_F(FlWaylandDisplayTest, PresentationMissing) {
+  wayland.has_presentation = false;
+
+  g_autoptr(FlWaylandDisplay) display =
+      fl_wayland_display_open(fl_mock_wayland_get_display());
+  ASSERT_NE(display, nullptr);
+  EXPECT_EQ(fl_wayland_display_get_presentation(display), nullptr);
+}

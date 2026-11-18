@@ -46,6 +46,7 @@ class MockWayland {
   // wl_subcompositor in the registry.
   bool has_compositor = true;
   bool has_subcompositor = true;
+  bool has_presentation = false;
 
   // Set to true to make wl_egl_window_create() fail.
   bool egl_window_create_fails = false;

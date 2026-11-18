@@ -7,6 +7,8 @@
 #include <gdk/gdkwayland.h>
 #include <wayland-client.h>
 
+#include "flutter/shell/platform/linux/presentation_time_client_protocol.h"
+
 // Key used to attach the #FlWaylandDisplay to the #GdkDisplay it was created
 // for, so the Wayland globals are only bound once per display.
 static const char* kWaylandDisplayKey = "fl-wayland-display";
@@ -17,9 +19,29 @@ struct _FlWaylandDisplay {
   // Wayland globals used to create subsurfaces.
   struct wl_compositor* compositor;
   struct wl_subcompositor* subcompositor;
+
+  // Optional presentation feedback. Null if the compositor does not support
+  // wp_presentation, in which case the engine keeps its natural frame grid.
+  struct wp_presentation* presentation;
+  uint32_t presentation_name;
+  uint32_t presentation_clock_id;
+  gboolean presentation_clock_id_valid;
 };
 
 G_DEFINE_TYPE(FlWaylandDisplay, fl_wayland_display, G_TYPE_OBJECT)
+
+static void presentation_clock_id_cb(void* data,
+                                     struct wp_presentation* presentation,
+                                     uint32_t clock_id) {
+  FlWaylandDisplay* self = FL_WAYLAND_DISPLAY(data);
+  (void)presentation;
+  self->presentation_clock_id = clock_id;
+  self->presentation_clock_id_valid = TRUE;
+}
+
+static const struct wp_presentation_listener kPresentationListener = {
+    .clock_id = presentation_clock_id_cb,
+};
 
 // Wayland registry handling.
 static void registry_global(void* data,
@@ -34,12 +56,30 @@ static void registry_global(void* data,
   } else if (g_strcmp0(interface, wl_subcompositor_interface.name) == 0) {
     self->subcompositor = static_cast<struct wl_subcompositor*>(
         wl_registry_bind(registry, name, &wl_subcompositor_interface, 1));
+  } else if (g_strcmp0(interface, wp_presentation_interface.name) == 0) {
+    self->presentation = static_cast<struct wp_presentation*>(wl_registry_bind(
+        registry, name, &wp_presentation_interface,
+        MIN(version,
+            static_cast<uint32_t>(wp_presentation_interface.version))));
+    self->presentation_name = name;
+    wp_presentation_add_listener(self->presentation, &kPresentationListener,
+                                 self);
   }
 }
 
 static void registry_global_remove(void* data,
                                    struct wl_registry* registry,
-                                   uint32_t name) {}
+                                   uint32_t name) {
+  FlWaylandDisplay* self = FL_WAYLAND_DISPLAY(data);
+  (void)registry;
+  if (name == self->presentation_name && self->presentation != nullptr) {
+    wp_presentation_destroy(self->presentation);
+    self->presentation = nullptr;
+    self->presentation_name = 0;
+    self->presentation_clock_id = 0;
+    self->presentation_clock_id_valid = FALSE;
+  }
+}
 
 static const struct wl_registry_listener kRegistryListener = {
     .global = registry_global,
@@ -53,6 +93,14 @@ static gboolean bind_globals(FlWaylandDisplay* self,
   struct wl_registry* registry = wl_display_get_registry(display);
   wl_registry_add_listener(registry, &kRegistryListener, self);
   wl_display_roundtrip(display);
+
+  // wp_presentation is bound from the registry callback, after the roundtrip's
+  // sync request was sent. A second roundtrip receives its clock_id event, so
+  // users of the proxy see a usable presentation clock immediately.
+  if (self->presentation != nullptr) {
+    wl_display_roundtrip(display);
+  }
+
   wl_registry_destroy(registry);
 
   return self->compositor != nullptr && self->subcompositor != nullptr;
@@ -61,6 +109,10 @@ static gboolean bind_globals(FlWaylandDisplay* self,
 static void fl_wayland_display_dispose(GObject* object) {
   FlWaylandDisplay* self = FL_WAYLAND_DISPLAY(object);
 
+  if (self->presentation != nullptr) {
+    wp_presentation_destroy(self->presentation);
+    self->presentation = nullptr;
+  }
   g_clear_pointer(&self->subcompositor, wl_subcompositor_destroy);
   g_clear_pointer(&self->compositor, wl_compositor_destroy);
 
@@ -116,4 +168,15 @@ FlSubsurface* fl_wayland_display_create_subsurface(
 
   return fl_subsurface_new(self->compositor, self->subcompositor,
                            parent_surface);
+}
+
+struct wp_presentation* fl_wayland_display_get_presentation(
+    FlWaylandDisplay* self) {
+  g_return_val_if_fail(FL_IS_WAYLAND_DISPLAY(self), nullptr);
+  return self->presentation;
+}
+
+uint32_t fl_wayland_display_get_presentation_clock_id(FlWaylandDisplay* self) {
+  g_return_val_if_fail(FL_IS_WAYLAND_DISPLAY(self), 0);
+  return self->presentation_clock_id_valid ? self->presentation_clock_id : 0;
 }

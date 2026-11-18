@@ -219,6 +219,10 @@ int wl_display_roundtrip(struct wl_display* display) {
       listener->global(registry->listener_data, registry_proxy, name++,
                        wl_subcompositor_interface.name, 1);
     }
+    if (mock != nullptr && mock->has_presentation) {
+      listener->global(registry->listener_data, registry_proxy, name++,
+                       "wp_presentation", 2);
+    }
   }
 
   return 0;

@@ -10,6 +10,7 @@
 #include "flutter/shell/platform/linux/fl_subsurface.h"
 
 struct wl_display;
+struct wp_presentation;
 
 G_BEGIN_DECLS
 
@@ -67,6 +68,30 @@ FlWaylandDisplay* fl_wayland_display_get_for_display(GdkDisplay* display);
 FlSubsurface* fl_wayland_display_create_subsurface(
     FlWaylandDisplay* display,
     struct wl_surface* parent_surface);
+
+/**
+ * fl_wayland_display_get_presentation:
+ * @display: an #FlWaylandDisplay.
+ *
+ * Gets the wp_presentation proxy bound for @display, or %NULL if the
+ * compositor does not support presentation feedback. The proxy is owned by
+ * @display.
+ *
+ * Returns: (transfer none) (nullable): a `struct wp_presentation`.
+ */
+struct wp_presentation* fl_wayland_display_get_presentation(
+    FlWaylandDisplay* display);
+
+/**
+ * fl_wayland_display_get_presentation_clock_id:
+ * @display: an #FlWaylandDisplay.
+ *
+ * Gets the clock used by the presentation feedback, or zero if unknown.
+ *
+ * Returns: a clockid_t value, or zero.
+ */
+uint32_t fl_wayland_display_get_presentation_clock_id(
+    FlWaylandDisplay* display);
 
 G_END_DECLS
 
