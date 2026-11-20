@@ -4,6 +4,7 @@
 
 #include "flutter/shell/platform/linux/fl_presentation_phase.h"
 
+#include <algorithm>
 #include <functional>
 
 #include "gtest/gtest.h"
@@ -13,6 +14,12 @@ namespace {
 constexpr gint64 kInterval60 = 16667;
 constexpr gint64 kInterval144 = 6944;
 constexpr gint64 kInterval240 = 4167;
+
+// Distance the controller keeps from a deadline or target it walked to.
+gint64 SafetyMargin(gint64 interval_us) {
+  return std::min(std::max(static_cast<gint64>(900), interval_us / 8),
+                  interval_us / 4);
+}
 
 // From the presentation-time protocol.
 constexpr uint32_t kFixedRate = 0x10;
@@ -85,7 +92,8 @@ TEST(FlPresentationPhaseTest, LateCommitMovesLaterAndSettles) {
   EXPECT_GT(phase.offset_us(), kInterval60 / 2);
   EXPECT_LT(phase.offset_us(), kInterval60);
   const gint64 settled_latency = latency(phase.offset_us());
-  EXPECT_LE(settled_latency, kInterval60 / 8 + 1000);
+  EXPECT_LE(settled_latency,
+            kInterval60 / 8 + 1000 + SafetyMargin(kInterval60));
   EXPECT_GE(settled_latency, 0);
 
   // The settled phase must be stable, not oscillate between probes.
@@ -110,7 +118,8 @@ TEST(FlPresentationPhaseTest, CommitAfterDeadlineWalksALargeStepLater) {
   EXPECT_GT(phase.offset_us(), kInterval60 * 3 / 4);
   EXPECT_LT(phase.offset_us(), kInterval60);
   const gint64 settled_latency = latency(phase.offset_us());
-  EXPECT_LE(settled_latency, kInterval60 / 8 + 1000);
+  EXPECT_LE(settled_latency,
+            kInterval60 / 8 + 1000 + SafetyMargin(kInterval60));
   EXPECT_EQ(CountLateFrames(&phase, latency, kInterval60, 300, &now_us), 0);
 }
 
@@ -133,7 +142,8 @@ TEST(FlPresentationPhaseTest, StartupStallsDoNotFreezeTheSearch) {
   RunSamples(&phase, latency, kInterval60, 400, &now_us);
 
   EXPECT_GT(phase.offset_us(), 0);
-  EXPECT_LE(latency(phase.offset_us()), kInterval60 / 8 + 1000);
+  EXPECT_LE(latency(phase.offset_us()),
+            kInterval60 / 8 + 1000 + SafetyMargin(kInterval60));
 }
 
 TEST(FlPresentationPhaseTest, AlreadyEarlyGridIsLeftAlone) {
@@ -173,17 +183,17 @@ TEST(FlPresentationPhaseTest, StepAcrossDeadlineBisectsInsteadOfGivingUp) {
 
   // The compositor needs a lot of lead time, so the target latency is not
   // reachable. The first step already crosses the deadline; the controller
-  // must bisect and settle just before it instead of reverting to the
-  // unshifted grid.
+  // must bisect to find it and settle a safety margin before it, which wraps
+  // the offset around the period.
   auto latency = [](gint64 offset) {
     return VblankLatency(offset, 6000, 5500, kInterval60);
   };
   RunSamples(&phase, latency, kInterval60, 400, &now_us);
 
-  EXPECT_GT(phase.offset_us(), 0);
-  EXPECT_LT(phase.offset_us(), 500);
-  EXPECT_LT(latency(phase.offset_us()), 6000);
-  EXPECT_GE(latency(phase.offset_us()), 5500);
+  EXPECT_GT(phase.offset_us(), kInterval60 / 2);
+  EXPECT_GE(latency(phase.offset_us()), 5500 + SafetyMargin(kInterval60));
+  EXPECT_LT(latency(phase.offset_us()), 5500 + SafetyMargin(kInterval60) + 500);
+  EXPECT_EQ(CountLateFrames(&phase, latency, kInterval60, 300, &now_us), 0);
 }
 
 TEST(FlPresentationPhaseTest, FrozenControllerRelearnsAfterWorkloadChange) {
@@ -207,7 +217,8 @@ TEST(FlPresentationPhaseTest, FrozenControllerRelearnsAfterWorkloadChange) {
   RunSamples(&phase, second, kInterval144, 600, &now_us);
 
   EXPECT_NE(phase.offset_us(), first_offset);
-  EXPECT_LE(second(phase.offset_us()), kInterval144 / 8 + 1000);
+  EXPECT_LE(second(phase.offset_us()),
+            kInterval144 / 8 + 1000 + SafetyMargin(kInterval144));
   EXPECT_EQ(CountLateFrames(&phase, second, kInterval144, 300, &now_us), 0);
 }
 
@@ -252,7 +263,8 @@ TEST(FlPresentationPhaseTest, HighRefreshRateDoesNotOvershoot) {
   EXPECT_LT(phase.offset_us(), kInterval240);
   const gint64 settled_latency = latency(phase.offset_us());
   EXPECT_GT(settled_latency, 0);
-  EXPECT_LE(settled_latency, kInterval240 / 8 + 1000);
+  EXPECT_LE(settled_latency,
+            kInterval240 / 8 + 1000 + SafetyMargin(kInterval240));
   EXPECT_EQ(CountLateFrames(&phase, latency, kInterval240, 300, &now_us), 0);
 }
 
@@ -376,7 +388,184 @@ TEST(FlPresentationPhaseTest, TwoHundredFortyHzConverges) {
   EXPECT_LT(phase.offset_us(), kInterval240);
   const gint64 latency =
       VblankLatency(phase.offset_us(), 3800, 300, kInterval240);
-  EXPECT_LE(latency, kInterval240 / 8 + 1000);
+  EXPECT_LE(latency, kInterval240 / 8 + 1000 + SafetyMargin(kInterval240));
+}
+
+// A compositor that replaces a late commit with the next one: a frame whose
+// commit jitter pushes it over the deadline is discarded instead of being
+// presented a refresh late. Returns the number of discarded frames.
+int RunWithDiscards(FlPresentationPhase* phase,
+                    gint64 natural_latency_us,
+                    gint64 lead_us,
+                    gint64 jitter_us,
+                    gint64 interval_us,
+                    int frames,
+                    gint64* now_us) {
+  int discarded = 0;
+  for (int i = 0; i < frames; i++) {
+    const gint64 offset = phase->offset_us();
+    const gint64 jitter = i % 2 == 0 ? 0 : jitter_us;
+    const gint64 on_time =
+        VblankLatency(offset, natural_latency_us, lead_us, interval_us);
+    const gint64 latency = VblankLatency(offset + jitter, natural_latency_us,
+                                         lead_us, interval_us);
+
+    if (latency > on_time + interval_us / 2) {
+      discarded++;
+      phase->AddDiscard();
+    } else {
+      phase->AddSample(latency, interval_us, kFixedRate, *now_us);
+    }
+    *now_us += interval_us;
+  }
+
+  return discarded;
+}
+
+TEST(FlPresentationPhaseTest, DiscardedFramesCountAsMisses) {
+  FlPresentationPhase phase(kInterval240);
+  gint64 now_us = 1000000;
+
+  // The target is not reachable, so the search ends at the deadline. Frames
+  // past it are discarded and never reported as presented; the controller
+  // must still see the crossing and keep a margin that covers the jitter.
+  RunWithDiscards(&phase, 3500, 1500, 300, kInterval240, 800, &now_us);
+
+  EXPECT_EQ(
+      RunWithDiscards(&phase, 3500, 1500, 300, kInterval240, 1000, &now_us), 0);
+}
+
+TEST(FlPresentationPhaseTest, SettledPhaseBacksOffOnDiscards) {
+  FlPresentationPhase phase(kInterval60);
+  gint64 now_us = 1000000;
+
+  RunSamples(
+      &phase,
+      [](gint64 offset) {
+        return VblankLatency(offset, 14667, 500, kInterval60);
+      },
+      kInterval60, 400, &now_us);
+  const gint64 settled_offset = phase.offset_us();
+  ASSERT_GT(settled_offset, 0);
+
+  // The workload became slower and commits now miss the deadline. Two
+  // discarded frames move the phase earlier by the safety margin.
+  EXPECT_FALSE(phase.AddDiscard());
+  EXPECT_TRUE(phase.AddDiscard());
+  EXPECT_EQ(phase.offset_us(), settled_offset - SafetyMargin(kInterval60));
+}
+
+TEST(FlPresentationPhaseTest, EarlierProbeFindsDeadlineThatMovedEarlier) {
+  FlPresentationPhase phase(kInterval240);
+  gint64 now_us = 1000000;
+
+  // The compositor first queues every frame for one more refresh, so the
+  // latency is above one refresh.
+  auto queued = [](gint64 offset) {
+    return VblankLatency(offset, 3500, 1500, kInterval240) + kInterval240;
+  };
+  RunSamples(&phase, queued, kInterval240, 800, &now_us);
+  ASSERT_LT(queued(phase.offset_us()),
+            kInterval240 + 1500 + SafetyMargin(kInterval240) + 500);
+
+  // Then it stops queueing and its deadline moves 1.2ms earlier. The settled
+  // phase is now a refresh late, which looks as stable as before. Only a
+  // probe that moves the commit earlier can find the new deadline.
+  auto direct = [](gint64 offset) {
+    return VblankLatency(offset + 1200, 3500, 1500, kInterval240);
+  };
+  RunSamples(&phase, direct, kInterval240, 240 * 12, &now_us);
+
+  EXPECT_LT(direct(phase.offset_us()), 1500 + SafetyMargin(kInterval240) + 500);
+  EXPECT_EQ(CountLateFrames(&phase, direct, kInterval240, 300, &now_us), 0);
+}
+
+TEST(FlPresentationPhaseTest, BackOffDoesNotStartANewSearch) {
+  FlPresentationPhase phase(kInterval60);
+  gint64 now_us = 1000000;
+
+  auto latency = [](gint64 offset) {
+    return VblankLatency(offset, 14667, 500, kInterval60);
+  };
+  RunSamples(&phase, latency, kInterval60, 400, &now_us);
+  for (int i = 0; i < 2; i++) {
+    phase.AddDiscard();
+    ASSERT_TRUE(phase.AddDiscard());
+    RunSamples(&phase, latency, kInterval60, 20, &now_us);
+  }
+  const gint64 backed_off = phase.offset_us();
+
+  // Each step back makes the latency higher by the margin. That is expected
+  // and must not look like a regression that restarts the search.
+  EXPECT_EQ(CountLateFrames(&phase, latency, kInterval60, 600, &now_us), 0);
+  EXPECT_EQ(phase.offset_us(), backed_off);
+}
+
+TEST(FlPresentationPhaseTest, DeadlineThatMovesEarlierIsFoundByMovingEarlier) {
+  FlPresentationPhase phase(kInterval60);
+  gint64 now_us = 1000000;
+
+  RunSamples(
+      &phase,
+      [](gint64 offset) {
+        return VblankLatency(offset, 14667, 500, kInterval60);
+      },
+      kInterval60, 400, &now_us);
+
+  // The deadline moves 6ms earlier, more than the headroom, so every frame is
+  // now a refresh late. The controller must move the phase earlier instead
+  // of walking a whole period later and crossing the deadline again.
+  auto shifted = [](gint64 offset) {
+    return VblankLatency(offset + 6000, 14667, 500, kInterval60);
+  };
+  RunSamples(&phase, shifted, kInterval60, 40, &now_us);
+  EXPECT_LT(shifted(phase.offset_us()), kInterval60 / 2);
+  RunSamples(&phase, shifted, kInterval60, 300, &now_us);
+
+  EXPECT_LT(shifted(phase.offset_us()),
+            500 + kInterval60 / 8 + SafetyMargin(kInterval60) + 1000);
+  EXPECT_EQ(CountLateFrames(&phase, shifted, kInterval60, 600, &now_us), 0);
+}
+
+TEST(FlPresentationPhaseTest, DeadlineThatMovesLaterIsFollowed) {
+  FlPresentationPhase phase(kInterval60);
+  gint64 now_us = 1000000;
+
+  auto first = [](gint64 offset) {
+    return VblankLatency(offset, 14667, 500, kInterval60);
+  };
+  RunSamples(&phase, first, kInterval60, 400, &now_us);
+  const gint64 settled_latency = first(phase.offset_us());
+
+  // The deadline moves 3.7ms later. Frames stay on time, but the latency is
+  // higher than needed; the controller must find the new deadline.
+  auto later = [](gint64 offset) {
+    return VblankLatency(offset - 3700, 14667, 500, kInterval60);
+  };
+  RunSamples(&phase, later, kInterval60, 400, &now_us);
+
+  EXPECT_LE(later(phase.offset_us()), settled_latency + 500);
+  EXPECT_EQ(CountLateFrames(&phase, later, kInterval60, 300, &now_us), 0);
+}
+
+TEST(FlPresentationPhaseTest, DeadlineThatMovesEarlierKeepsTheMargin) {
+  FlPresentationPhase phase(kInterval60);
+  gint64 now_us = 1000000;
+
+  auto first = [](gint64 offset) {
+    return VblankLatency(offset, 14667, 500, kInterval60);
+  };
+  RunSamples(&phase, first, kInterval60, 400, &now_us);
+  const gint64 settled_latency = first(phase.offset_us());
+
+  // The deadline moves 1.5ms earlier. Frames are still on time, but closer
+  // to the deadline than the margin allows.
+  auto earlier = [](gint64 offset) {
+    return VblankLatency(offset + 1500, 14667, 500, kInterval60);
+  };
+  RunSamples(&phase, earlier, kInterval60, 200, &now_us);
+
+  EXPECT_GE(earlier(phase.offset_us()), settled_latency - 500);
 }
 
 }  // namespace

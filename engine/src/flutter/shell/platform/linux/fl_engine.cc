@@ -8,6 +8,7 @@
 #include <gmodule.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include "flutter/common/constants.h"
@@ -46,6 +47,9 @@ static constexpr double kDefaultRefreshRate = 60.0;
 static constexpr gint64 kDefaultFrameIntervalUs = 16667;
 static constexpr gint64 kMinFrameIntervalUs = 1000;
 static constexpr gint64 kMaxFrameIntervalUs = 100000;
+
+// WP_PRESENTATION_FEEDBACK_KIND_VSYNC_VARIABLE_RATE from presentation-time.
+static constexpr uint32_t kPresentedVariableRate = 0x20;
 
 struct _FlEngine {
   GObject parent_instance;
@@ -124,6 +128,10 @@ struct _FlEngine {
   GMutex vsync_mutex;
   gint64 frame_interval_us;
   gint64 frame_grid_origin_us;
+  gint64 last_frame_start_us;
+  // Last compositor vblank the grid snaps to; zero without fixed-rate feedback.
+  gint64 vblank_time_ns;
+  gint64 vblank_period_ns;
   // How far later than the natural grid the next frame should start. Learned
   // from Wayland presentation feedback; zero when feedback is unavailable.
   gint64 presentation_phase_us;
@@ -220,12 +228,28 @@ static gint64 fl_engine_refresh_rate_to_interval(double refresh_rate) {
   return static_cast<gint64>(llround(interval_us));
 }
 
+// Returns @time_us unchanged when no vblank is known.
+static gint64 fl_engine_snap_to_vblank_locked(FlEngine* self, gint64 time_us) {
+  const gint64 period_ns = self->vblank_period_ns;
+  if (self->vblank_time_ns <= 0 || period_ns <= 0) {
+    return time_us;
+  }
+
+  const gint64 delta_ns = time_us * 1000 - self->vblank_time_ns;
+  gint64 periods = (std::llabs(delta_ns) + period_ns / 2) / period_ns;
+  if (delta_ns < 0) {
+    periods = -periods;
+  }
+
+  return (self->vblank_time_ns + periods * period_ns + 500) / 1000;
+}
+
 // Gets the time the next frame should start. If no frame has been scheduled
 // yet, start it immediately.
 //
 // The start is the natural grid boundary plus the presentation phase, which is
 // a delay. The grid itself is kept unshifted so a phase change only moves the
-// starts and cannot make the boundaries drift.
+// starts. With presentation feedback the boundaries are real vblanks.
 static gint64 fl_engine_next_frame_start_locked(FlEngine* self, gint64 now) {
   gint64 interval = self->frame_interval_us;
   if (interval <= 0) {
@@ -235,13 +259,18 @@ static gint64 fl_engine_next_frame_start_locked(FlEngine* self, gint64 now) {
     // Start the first frame immediately, then anchor the grid to it. The
     // phase is not applied to this frame so startup is not delayed.
     self->frame_grid_origin_us = now;
+    self->last_frame_start_us = now;
     return now;
   }
 
   // The origin is the unshifted boundary used for the previous frame. Advance
   // by exactly one interval so two frames can never be produced in one refresh
   // period, even if the request for this frame arrived early.
-  gint64 boundary = self->frame_grid_origin_us + interval;
+  const gint64 origin = self->frame_grid_origin_us;
+  gint64 boundary = fl_engine_snap_to_vblank_locked(self, origin + interval);
+  if (boundary <= origin + interval / 2) {
+    boundary = fl_engine_snap_to_vblank_locked(self, boundary + interval);
+  }
   gint64 phase =
       CLAMP(self->presentation_phase_us, static_cast<gint64>(0), interval - 1);
   gint64 start = boundary + phase;
@@ -252,14 +281,27 @@ static gint64 fl_engine_next_frame_start_locked(FlEngine* self, gint64 now) {
   // again. This keeps the learned phase instead of re-anchoring the grid to a
   // late request; the cost is one skipped refresh when the phase shrinks by
   // almost a whole period, which only happens when the compositor or surface
-  // changed.
-  if (start <= now) {
-    const gint64 missed = (now - start) / interval + 1;
-    boundary += missed * interval;
-    start += missed * interval;
+  // changed. A phase that wraps from the end of the period to its start must
+  // not start two frames in one period either.
+  const gint64 earliest =
+      MAX(now + 1, self->last_frame_start_us + interval / 2);
+  while (start < earliest) {
+    const gint64 missed = (earliest - start + interval - 1) / interval;
+    boundary =
+        fl_engine_snap_to_vblank_locked(self, boundary + missed * interval);
+    start = boundary + phase;
+  }
+
+  // A phase that wraps from the start of the period to its end moves the frame
+  // earlier, onto the previous boundary, not a whole period later.
+  while (start - interval >= earliest) {
+    boundary = fl_engine_snap_to_vblank_locked(self, boundary - interval);
+    start = boundary + phase;
   }
 
   self->frame_grid_origin_us = boundary;
+  self->last_frame_start_us = start;
+
   return start;
 }
 
@@ -484,6 +526,8 @@ static void fl_engine_set_refresh_rate(FlEngine* self, double refresh_rate) {
             self->frame_interval_us, interval);
     self->frame_interval_us = interval;
     self->frame_grid_origin_us = 0;
+    self->vblank_time_ns = 0;
+    self->vblank_period_ns = 0;
     self->presentation_phase_us = 0;
   }
   g_mutex_unlock(&self->vsync_mutex);
@@ -1575,33 +1619,52 @@ void fl_engine_schedule_frame(FlEngine* self) {
   }
 }
 
-void fl_engine_add_presentation_sample(FlEngine* self,
-                                       gint64 latency_us,
-                                       gint64 refresh_us,
-                                       uint32_t flags) {
-  g_return_if_fail(FL_IS_ENGINE(self));
-
+// The engine has a single animator, while views can be on outputs with
+// different refresh phases. Feedback is only used when there is at most one
+// view; multi-view windows keep the natural grid until per-view scheduling
+// exists.
+static gboolean fl_engine_uses_presentation_feedback(FlEngine* self) {
   if (self->engine == nullptr || self->presentation_phase == nullptr) {
-    return;
+    return FALSE;
   }
 
-  // The engine has a single animator, while views can be on outputs with
-  // different refresh phases. Only use feedback when there is at most one view;
-  // multi-view windows keep the natural grid until per-view scheduling exists.
   g_mutex_lock(&self->renderables_mutex);
   const gboolean single_view =
       self->renderables_by_view_id == nullptr ||
       g_hash_table_size(self->renderables_by_view_id) <= 1;
   g_mutex_unlock(&self->renderables_mutex);
-  if (!single_view) {
+
+  return single_view;
+}
+
+// A variable rate or mismatched sample returns the grid to the GDK rate. A
+// sample without a refresh period keeps the last vblank: KWin reports none
+// while it may still refresh at the fixed rate.
+static void fl_engine_update_vblank(FlEngine* self,
+                                    gint64 presented_ns,
+                                    gint64 refresh_ns,
+                                    uint32_t flags) {
+  if (refresh_ns == 0 && (flags & kPresentedVariableRate) == 0) {
     return;
   }
 
-  if (!self->presentation_phase->AddSample(latency_us, refresh_us, flags,
-                                           g_get_monotonic_time())) {
-    return;
-  }
+  g_mutex_lock(&self->vsync_mutex);
 
+  const gint64 interval_ns =
+      (self->frame_interval_us > 0 ? self->frame_interval_us
+                                   : kDefaultFrameIntervalUs) *
+      1000;
+  const gboolean usable =
+      (flags & kPresentedVariableRate) == 0 && presented_ns > 0 &&
+      refresh_ns > 0 &&
+      std::llabs(refresh_ns - interval_ns) <= interval_ns / 10;
+
+  self->vblank_time_ns = usable ? presented_ns : 0;
+  self->vblank_period_ns = usable ? refresh_ns : 0;
+  g_mutex_unlock(&self->vsync_mutex);
+}
+
+static void fl_engine_apply_presentation_offset(FlEngine* self) {
   const gint64 offset_us = self->presentation_phase->offset_us();
   g_mutex_lock(&self->vsync_mutex);
   const gint64 interval_us = self->frame_interval_us > 0
@@ -1611,6 +1674,37 @@ void fl_engine_add_presentation_sample(FlEngine* self,
   self->presentation_phase_us =
       CLAMP(offset_us, static_cast<gint64>(0), interval_us);
   g_mutex_unlock(&self->vsync_mutex);
+}
+
+void fl_engine_add_presentation_sample(FlEngine* self,
+                                       gint64 presented_ns,
+                                       gint64 latency_us,
+                                       gint64 refresh_ns,
+                                       uint32_t flags) {
+  g_return_if_fail(FL_IS_ENGINE(self));
+
+  if (!fl_engine_uses_presentation_feedback(self)) {
+    return;
+  }
+
+  fl_engine_update_vblank(self, presented_ns, refresh_ns, flags);
+
+  if (self->presentation_phase->AddSample(latency_us, refresh_ns / 1000, flags,
+                                          g_get_monotonic_time())) {
+    fl_engine_apply_presentation_offset(self);
+  }
+}
+
+void fl_engine_add_presentation_discard(FlEngine* self) {
+  g_return_if_fail(FL_IS_ENGINE(self));
+
+  if (!fl_engine_uses_presentation_feedback(self)) {
+    return;
+  }
+
+  if (self->presentation_phase->AddDiscard()) {
+    fl_engine_apply_presentation_offset(self);
+  }
 }
 
 void fl_engine_reset_presentation_phase(FlEngine* self) {

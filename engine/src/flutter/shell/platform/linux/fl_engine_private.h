@@ -261,17 +261,31 @@ void fl_engine_schedule_frame(FlEngine* engine);
 /**
  * fl_engine_add_presentation_sample:
  * @engine: an #FlEngine.
+ * @presented_ns: CLOCK_MONOTONIC time the frame was displayed, in nanoseconds,
+ * or zero if unknown.
  * @latency_us: time from commit to the frame being displayed, in microseconds.
- * @refresh_us: compositor refresh interval in microseconds, or zero if unknown.
+ * @refresh_ns: compositor refresh interval in nanoseconds, or zero if unknown.
  * @flags: WP_PRESENTATION_FEEDBACK_KIND_* flags.
  *
  * Reports presentation feedback for a committed frame. The engine uses it to
- * adjust the phase of the frame grid. Must be called on the GTK thread.
+ * align the frame grid with the display refresh and to adjust its phase. Must
+ * be called on the GTK thread.
  */
 void fl_engine_add_presentation_sample(FlEngine* engine,
+                                       gint64 presented_ns,
                                        gint64 latency_us,
-                                       gint64 refresh_us,
+                                       gint64 refresh_ns,
                                        uint32_t flags);
+
+/**
+ * fl_engine_add_presentation_discard:
+ * @engine: an #FlEngine.
+ *
+ * Reports that a committed frame was never displayed because a later commit
+ * replaced it. This happens when a commit misses the compositor's deadline.
+ * Must be called on the GTK thread.
+ */
+void fl_engine_add_presentation_discard(FlEngine* engine);
 
 /**
  * fl_engine_reset_presentation_phase:

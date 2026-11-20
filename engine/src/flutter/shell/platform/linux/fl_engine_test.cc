@@ -215,7 +215,7 @@ TEST_F(FlEngineTest, VsyncUsesPresentationPhase) {
   // A commit that is presented almost a full refresh later tells the
   // controller the grid can be started later.
   for (int i = 0; i < 24; i++) {
-    fl_engine_add_presentation_sample(engine, 16000, 16667, 0x10);
+    fl_engine_add_presentation_sample(engine, 0, 16000, 16667000, 0x10);
   }
   const gint64 phase = fl_engine_get_presentation_phase(engine);
   ASSERT_GT(phase, 0);
@@ -256,7 +256,7 @@ TEST_F(FlEngineTest, RefreshRateChangeResetsPresentationPhase) {
   callback(engine, 42);
 
   for (int i = 0; i < 24; i++) {
-    fl_engine_add_presentation_sample(engine, 16000, 16667, 0x10);
+    fl_engine_add_presentation_sample(engine, 0, 16000, 16667000, 0x10);
   }
   ASSERT_GT(fl_engine_get_presentation_phase(engine), 0);
 
@@ -355,6 +355,42 @@ TEST_F(FlEngineTest, LateRequestKeepsTheGridPhase) {
   const uint64_t delta = starts[1] - starts[0];
   EXPECT_GE(delta, 2 * interval);
   EXPECT_LE(delta, 3 * interval);
+}
+
+// Checks presentation feedback aligns the frame grid with the compositor's
+// vblank clock, even when the GDK refresh rate is slightly different.
+TEST_F(FlEngineTest, VsyncSnapsToPresentationTime) {
+  ::testing::NiceMock<flutter::testing::MockGtk> gtk;
+  ON_CALL(gtk, gdk_monitor_get_refresh_rate(::testing::_))
+      .WillByDefault(::testing::Return(60000));
+
+  std::vector<uint64_t> starts;
+  VsyncCallback callback = start_engine_with_vsync(
+      engine,
+      [&](uint64_t start, uint64_t target) { starts.push_back(start); });
+
+  fl_engine_send_window_metrics_event(engine, 1, 1, 100, 100, 100, 100, 1.0);
+  callback(engine, 42);
+  ASSERT_EQ(starts.size(), 1u);
+
+  // 59.95Hz, while GDK reported 60Hz.
+  constexpr gint64 kRefreshNs = 16680000;
+  const gint64 vblank_ns = static_cast<gint64>(starts[0]) + 3000000;
+  fl_engine_add_presentation_sample(engine, vblank_ns, 3000, kRefreshNs, 0x10);
+
+  for (size_t frame = 2; frame <= 4; frame++) {
+    callback(engine, 42);
+    ASSERT_TRUE(RunMainContextUntil([&] { return starts.size() == frame; }));
+  }
+
+  // The main loop dispatches the delivery a little after the vblank, never
+  // before it. Without snapping the starts would be ~13.7ms after a vblank.
+  for (size_t i = 1; i < starts.size(); i++) {
+    const gint64 delta = static_cast<gint64>(starts[i]) - vblank_ns;
+    const gint64 remainder = ((delta % kRefreshNs) + kRefreshNs) % kRefreshNs;
+    EXPECT_LT(remainder, 1000000)
+        << "start " << i << " is " << remainder << "ns after a vblank";
+  }
 }
 
 // Checks asking the engine to render a frame works.

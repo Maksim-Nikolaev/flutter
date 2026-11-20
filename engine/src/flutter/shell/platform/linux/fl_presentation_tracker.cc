@@ -102,8 +102,10 @@ static void feedback_presented_cb(void* data,
     const gint64 latency_us = presented_us - sample->commit_time_us;
     g_autoptr(FlEngine) engine = FL_ENGINE(g_weak_ref_get(&self->engine));
     if (engine != nullptr) {
-      fl_engine_add_presentation_sample(engine, latency_us, refresh / 1000,
-                                        flags);
+      const gint64 presented_ns =
+          static_cast<gint64>(tv_sec) * 1000000000 + tv_nsec;
+      fl_engine_add_presentation_sample(engine, presented_ns, latency_us,
+                                        refresh, flags);
     }
     if (presentation_tracker_verbose_enabled()) {
       g_debug("FlPresentationTracker: latency %" G_GINT64_FORMAT
@@ -125,6 +127,13 @@ static void feedback_discarded_cb(void* data,
                                   struct wp_presentation_feedback* feedback) {
   FlPresentationSample* sample = static_cast<FlPresentationSample*>(data);
   FlPresentationTracker* self = sample->tracker;
+
+  if (g_atomic_int_get(&self->enabled)) {
+    g_autoptr(FlEngine) engine = FL_ENGINE(g_weak_ref_get(&self->engine));
+    if (engine != nullptr) {
+      fl_engine_add_presentation_discard(engine);
+    }
+  }
 
   g_mutex_lock(&self->mutex);
   g_hash_table_remove(self->pending, feedback);
